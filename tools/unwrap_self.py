@@ -11,6 +11,8 @@ differ inside a container:
     bytes holding flags, data offset, size and the size again. Segments the table
     does not cover are placed by the vaddr to file mapping of the PT_LOAD that
     contains them; segments without a vaddr carry the shift of the last mapped one.
+    A segment with no file bytes may start where its PT_LOAD ends, like a PT_TLS
+    that holds only .tbss right after the last initialised data.
   - The segments are packed without honouring p_align, while ELF requires
     p_offset % p_align == p_vaddr % p_align. Every region is copied to an offset
     that satisfies it, which the relinker enforces on guest modules.
@@ -127,10 +129,11 @@ def place_segments(data, headers, records):
                 header["source"] = segment
                 break
 
-    def load_for(vaddr):
+    def load_for(vaddr, empty):
         found = None
         for header in loads:
-            if header["memory"] and header["vaddr"] <= vaddr < header["vaddr"] + header["memory"]:
+            end = header["vaddr"] + header["memory"]
+            if header["memory"] and header["vaddr"] <= vaddr and (vaddr < end or (empty and vaddr == end)):
                 found = header
         return found
 
@@ -139,7 +142,7 @@ def place_segments(data, headers, records):
         if header["type"] == PT_LOAD:
             continue
         if header["vaddr"] != 0:
-            host = load_for(header["vaddr"])
+            host = load_for(header["vaddr"], header["size"] == 0)
             if host is None:
                 raise Refused("segment %d vaddr %#x is in no PT_LOAD" % (header["index"], header["vaddr"]))
             header["host"] = host

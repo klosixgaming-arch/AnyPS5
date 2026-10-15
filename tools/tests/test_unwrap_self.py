@@ -13,6 +13,7 @@ ELF_HEADER_OFFSET = 0x1A0
 PROGRAM_TABLE_OFFSET = 0x40
 PT_LOAD = 1
 PT_DYNAMIC = 2
+PT_TLS = 7
 FIRST_REGION = 0x400
 
 HEADER = b"\x7fELF\x02\x01\x01\x09" + b"\x00" * 56
@@ -116,6 +117,18 @@ class UnwrapTest(unittest.TestCase):
         dynamic = [header for header in headers if header[0] == PT_DYNAMIC][0]
         self.assertEqual(dynamic[2], read_only[2] + (0x1040 - 0x1000))
         self.assertEqual(dynamic[2] % 8, 0x1040 % 8)
+
+    def test_an_empty_segment_may_start_at_the_end_of_its_load(self):
+        segments = default_segments() + [(PT_TLS, 4, 0x1590, 0x1080, 0, 8)]
+        container = bytearray(build_container(segments, default_records(), default_payloads()))
+        struct.pack_into("<Q", container, ELF_HEADER_OFFSET + PROGRAM_TABLE_OFFSET + 3 * 56 + 40, 0xAC)
+        result, output = self.convert(bytes(container))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data, headers = read_program_headers(output)
+        read_only = [header for header in headers if header[0] == PT_LOAD][1]
+        tls = [header for header in headers if header[0] == PT_TLS][0]
+        self.assertEqual((tls[3], tls[5], tls[6]), (0x1080, 0, 0xAC))
+        self.assertEqual(tls[2], read_only[2] + 0x80)
 
     def test_declared_offsets_are_used_when_the_container_has_no_records(self):
         segments = [(PT_LOAD, 1, 0x800, 0x0, 0x40, 0x1000), (PT_LOAD, 4, 0x900, 0x1000, 0x40, 0x1000)]
