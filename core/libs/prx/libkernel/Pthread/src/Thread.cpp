@@ -824,6 +824,10 @@ int APS5_VABI scePthreadDetach(Pthread thread) {
     if (!thread) return SCE_KERNEL_ERROR_EINVAL;
     {
         std::lock_guard lock(thread->_join_mtx);
+        if (thread->_joining) {
+            std::lock_guard nameGuard(thread->nameLock);
+            APS5_LOG_OUT("[join-diag] scePthreadDetach refused: thread %p '%s' has a joiner", static_cast<void*>(thread), thread->name.c_str());
+        }
         if (thread->_detached || thread->_joining) return SCE_KERNEL_ERROR_EINVAL;
         thread->_detached = true;
     }
