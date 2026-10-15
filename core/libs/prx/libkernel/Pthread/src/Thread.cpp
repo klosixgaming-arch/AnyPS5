@@ -790,7 +790,11 @@ int APS5_VABI scePthreadJoin(Pthread thread, void** retval) {
     {
         std::unique_lock lock(thread->_join_mtx);
         if (thread->_detached) return SCE_KERNEL_ERROR_EINVAL;
-        if (thread->_joining) return SCE_KERNEL_ERROR_EOPNOTSUPP;
+        if (thread->_joining) {
+            std::lock_guard nameGuard(thread->nameLock);
+            APS5_LOG_OUT("[join-diag] scePthreadJoin refused: thread %p '%s' already has a joiner", static_cast<void*>(thread), thread->name.c_str());
+            return SCE_KERNEL_ERROR_EOPNOTSUPP;
+        }
         thread->_joining = true;
         while (!thread->_finished.load()) {
             ThreadCancel::Wait(thread->_join_cv, lock, std::nullopt);
