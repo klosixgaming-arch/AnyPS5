@@ -1569,7 +1569,11 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     if (resolve) {
         const auto source = DecodeColorBuffer(cx, 0);
         const auto destination = DecodeColorBuffer(cx, 1);
-        Require(samples == 1 || source.samples == samples, "CB resolve from a target whose sample count differs from the rasterizer's");
+        if (!(samples == 1 || source.samples == samples)) {
+            char text[400];
+            std::snprintf(text, sizeof(text), "CB resolve from a target whose sample count differs from the rasterizer's [diag src=%u rast=%u dst=%u PA_SC_AA_CONFIG=0x%08x CB0_ATTRIB=0x%08x CB1_ATTRIB=0x%08x CB0_INFO=0x%08x CB1_INFO=0x%08x PA_SC_MODE_CNTL_0=0x%08x %ux%u fmt %d/%d]", source.samples, samples, destination.samples, value(0x2f8), value(0x31d), value(0x31d + 0xf), value(0x31c), value(0x31c + 0xf), value(0x292), source.extent.width, source.extent.height, static_cast<int>(source.format), static_cast<int>(destination.format));
+            throw std::runtime_error(text);
+        }
         Require(destination.samples == 1, "CB resolve into a multisampled target is unsupported");
         Require(destination.cmaskAddress == 0, "CB resolve into a fast-clear color target is unsupported (the resolve does not update its CMASK)");
         Require(source.format == destination.format && source.extent.width == destination.extent.width && source.extent.height == destination.extent.height, "CB resolve between different formats or extents is unsupported");
