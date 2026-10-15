@@ -271,6 +271,17 @@ GuestLocale::Implementation* APS5_VABI _ZNSt6locale16_GetgloballocaleEv_nid_post
     return &g_classicLocale;
 }
 
+namespace {
+struct GuestLocaleFacade {
+    GuestLocale::Implementation* implementation;
+};
+GuestLocaleFacade g_classicLocaleFacade{&g_classicLocale};
+}
+
+GuestLocaleFacade* APS5_VABI _ZNSt6locale7classicEv_nid_postfix() {
+    return &g_classicLocaleFacade;
+}
+
 void APS5_VABI _ZNSt7collateIwE7_GetcatEPPKNSt6locale5facetEPKS1__nid_postfix(GuestLocale::Facet**, const GuestLocale::Implementation*) {
     NotImplemented_nid_no_patch(__func__);
 }

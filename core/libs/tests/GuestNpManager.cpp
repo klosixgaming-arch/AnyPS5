@@ -4,9 +4,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 
 extern "C" {
 int APS5_VABI sceNpGetNpId(int user_id, NpId* np_id);
+int APS5_VABI sceNpUnknown_8weiQyIdI3A(int userId, void* buffer);
+int APS5_VABI sceNpUnknown_WxLcN76q19o(void);
 }
 
 extern "C" {
@@ -67,5 +71,20 @@ int main() {
     Require(sceNpGetNpId(0x10000, &npId) == SignedOut, "sceNpGetNpId must report the user as signed out");
     Require(std::memcmp(&npId, &untouched, sizeof(npId)) == 0, "sceNpGetNpId must leave the NpId untouched");
     Require(sceNpGetNpId(0x10000, nullptr) == InvalidArgument, "sceNpGetNpId must reject a null NpId");
+    unsigned char buffer[0x11]{};
+    try {
+        sceNpUnknown_8weiQyIdI3A(0x10000, buffer);
+        Require(false, "sceNpUnknown_8weiQyIdI3A must report that it is not implemented");
+    } catch (const std::runtime_error& error) {
+        Require(std::string(error.what()) == "sceNpUnknown_8weiQyIdI3A not implemented",
+            "sceNpUnknown_8weiQyIdI3A threw");
+    }
+    try {
+        sceNpUnknown_WxLcN76q19o();
+        Require(false, "sceNpUnknown_WxLcN76q19o must report that it is not implemented");
+    } catch (const std::runtime_error& error) {
+        Require(std::string(error.what()) == "sceNpUnknown_WxLcN76q19o not implemented",
+            "sceNpUnknown_WxLcN76q19o threw");
+    }
     return 0;
 }
