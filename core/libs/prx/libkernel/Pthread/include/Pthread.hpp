@@ -139,6 +139,7 @@ struct PthreadPrivate {
     void* _retval;
     bool _detached;
     bool _adopted;
+    bool _joining = false;
     std::mutex _join_mtx;
     TimedWait::Condition _join_cv;
     std::atomic<bool> cancelPending{false};
