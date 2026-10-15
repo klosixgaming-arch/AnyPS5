@@ -161,6 +161,23 @@ void _readFile(const Apr::ReadFileCommand& command) {
     static const bool trace = std::getenv("APS5_TRACE_APR") != nullptr;
     if (trace) std::fprintf(stderr, "[apr] read %s offset=0x%llx size=0x%llx -> 0x%llx\n", file.path.string().c_str(), static_cast<unsigned long long>(command.offset), static_cast<unsigned long long>(command.size), static_cast<unsigned long long>(command.destination));
     std::ifstream stream(file.path, std::ios::binary);
+    for (int attempt = 1; !stream && attempt <= 200; ++attempt) {
+        const int savedErrno = errno;
+#ifdef _WIN32
+        const unsigned long lastError = GetLastError();
+        const auto attributes = GetFileAttributesW(file.path.c_str());
+        HANDLE probe = CreateFileW(file.path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        const unsigned long probeError = probe == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+        if (probe != INVALID_HANDLE_VALUE) CloseHandle(probe);
+        std::fprintf(stderr, "[apr-diag] open failed attempt=%d errno=%d lastError=%lu attributes=0x%lx probeError=%lu thread=%lu %s\n", attempt, savedErrno, lastError, static_cast<unsigned long>(attributes), probeError, GetCurrentThreadId(), file.path.string().c_str());
+#else
+        std::fprintf(stderr, "[apr-diag] open failed attempt=%d errno=%d %s\n", attempt, savedErrno, file.path.string().c_str());
+#endif
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        stream.clear();
+        stream.open(file.path, std::ios::binary);
+        if (stream) std::fprintf(stderr, "[apr-diag] open succeeded on attempt %d\n", attempt + 1);
+    }
     if (!stream) throw std::runtime_error("APR: cannot open " + file.path.string());
     stream.seekg(static_cast<std::streamoff>(command.offset));
     const GuestArena::HostWrite destination(reinterpret_cast<void*>(command.destination), command.size);
