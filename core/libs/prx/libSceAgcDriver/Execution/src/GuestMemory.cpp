@@ -1207,6 +1207,15 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     }
     const auto lock = lockTracker(tracker);
     tracker.initialize();
+    {
+        static std::atomic<std::uint64_t> zeros[4]{};
+        const char* why = !tracker.watched ? "unwatched" : !tracker.coverage.Covers(address, bytes) ? "outside coverage" : GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes) ? "host region" : nullptr;
+        if (why != nullptr) {
+            const auto index = why[0] == 'u' ? 0 : why[0] == 'o' ? 1 : 2;
+            const auto n = zeros[index].fetch_add(1, std::memory_order_relaxed);
+            if (n < 6 || (n % 100000) == 0) std::fprintf(stderr, "[collect-diag] zero: %s address 0x%llx bytes 0x%llx count %llu\n", why, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(n + 1));
+        }
+    }
     if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
     auto cursor = first;
     if (useMemo && sharedCollectMemo()) {
@@ -1228,7 +1237,12 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
 #endif
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) {
+        static std::atomic<std::uint64_t> failed{0};
+        const auto n = failed.fetch_add(1, std::memory_order_relaxed);
+        if (n < 6 || (n % 100000) == 0) std::fprintf(stderr, "[collect-diag] zero: walk failed address 0x%llx bytes 0x%llx count %llu\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(n + 1));
+        return 0;
+    }
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
