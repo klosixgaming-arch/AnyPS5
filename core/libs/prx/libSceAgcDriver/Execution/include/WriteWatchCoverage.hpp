@@ -19,6 +19,9 @@ public:
         excludedGenerations.clear();
     }
 
+    std::uint64_t Base() const { return base; }
+    std::uint64_t Size() const { return size; }
+
     bool Covers(std::uint64_t address, std::size_t bytes) const {
         if (bytes == 0 || bytes > size || address < base || address - base > size - bytes) return false;
         const auto first = (address - base) / BlockBytes;

@@ -1213,7 +1213,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (why != nullptr) {
             const auto index = why[0] == 'u' ? 0 : why[0] == 'o' ? 1 : 2;
             const auto n = zeros[index].fetch_add(1, std::memory_order_relaxed);
-            if (n < 6 || (n % 100000) == 0) std::fprintf(stderr, "[collect-diag] zero: %s address 0x%llx bytes 0x%llx count %llu\n", why, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(n + 1));
+            if (n < 6 || (n % 100000) == 0) std::fprintf(stderr, "[collect-diag] zero: %s address 0x%llx bytes 0x%llx count %llu arena 0x%llx+0x%llx %s\n", why, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(n + 1), static_cast<unsigned long long>(tracker.coverage.Base()), static_cast<unsigned long long>(tracker.coverage.Size()), (address < tracker.coverage.Base() || address - tracker.coverage.Base() >= tracker.coverage.Size()) ? "OUTSIDE-ARENA" : "inside-arena-excluded-block");
         }
     }
     if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
