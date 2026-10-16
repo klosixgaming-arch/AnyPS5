@@ -1311,8 +1311,13 @@ void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
 #endif
 }
 
-void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
+void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes, const char* tag = "Unwatch") {
     if (!tracker.watched) return;
+    {
+        static std::atomic<std::uint64_t> n{0};
+        const auto k = n.fetch_add(1, std::memory_order_relaxed);
+        if (k < 40 || (k % 1000) == 0) std::fprintf(stderr, "[unwatch-diag] %s address 0x%llx bytes 0x%llx count %llu\n", tag, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(k + 1));
+    }
 #ifdef _WIN32
     tracker.startHints(address, bytes);
     if (tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix())) unwatchSerial.fetch_add(1, std::memory_order_release);
@@ -1381,12 +1386,12 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     }
     if (!imported) return false;
     if (!staysWatched) {
-        if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
-        unwatchLocked(tracker, address, bytes);
+        if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first), before ? "import-unwatched-walkfail" : "import-unwatched-nobefore");
+        unwatchLocked(tracker, address, bytes, "import-unwatched");
         return true;
     }
     const WindowCopy window{first, saved, slots};
-    if (!before || !walkWrites(tracker, first, stop, StampKind::Cpu, true, &window)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
+    if (!before || !walkWrites(tracker, first, stop, StampKind::Cpu, true, &window)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first), before ? "import-watched-walkfail" : "import-watched-nobefore");
     return true;
 }
 
@@ -1518,7 +1523,7 @@ std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
         const bool complete = GuestWriteWatch::GuestWriteWatchCollectFresh_nid_postfix(static_cast<std::uintptr_t>(blockFirst), static_cast<std::size_t>(blockStop - blockFirst), &stampWrittenRun, &runs);
 #endif
         if (!complete) {
-            unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
+            unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst), "markwritten-incomplete");
             tracker.noteUnstampedStore(address, address + bytes);
             return 0;
         }
