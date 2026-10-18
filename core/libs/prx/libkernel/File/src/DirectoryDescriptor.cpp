@@ -100,19 +100,24 @@ void DuplicateDirectoryDescriptor(int from, int to) {
 std::optional<std::int64_t> SeekDirectoryDescriptor(int fd, std::int64_t offset, int whence) {
     constexpr int SeekSet = 0;
     constexpr int SeekCurrent = 1;
+    constexpr int SeekEnd = 2;
     if (g_directoryCount == 0) return std::nullopt;
     const auto found = Find(fd);
     if (!found) return std::nullopt;
     auto& state = *found;
     std::lock_guard lock(state.mutex);
-    if (whence != SeekSet && whence != SeekCurrent) NotImplemented_nid_no_patch("lseek from the end of a directory descriptor");
     const auto cursor = static_cast<std::int64_t>(state.cursor);
     if (whence == SeekCurrent && offset == 0) return cursor;
-    if (whence == SeekCurrent && offset > std::numeric_limits<std::int64_t>::max() - cursor) {
+    std::int64_t base = cursor;
+    if (whence == SeekEnd) {
+        Load(state);
+        base = static_cast<std::int64_t>(state.entries.size());
+    }
+    if (whence != SeekSet && offset > std::numeric_limits<std::int64_t>::max() - base) {
         errno = EOVERFLOW;
         return std::int64_t{-1};
     }
-    const std::int64_t target = whence == SeekSet ? offset : cursor + offset;
+    const std::int64_t target = whence == SeekSet ? offset : base + offset;
     if (target < 0) {
         errno = EINVAL;
         return std::int64_t{-1};

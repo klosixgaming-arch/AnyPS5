@@ -95,6 +95,13 @@ int main() {
     const auto afterQuery = ReadAll(directory);
     Require(afterQuery == rest);
 
+    Require(sceKernelLseek(directory, 0, 2) == 5);
+    Require(sceKernelGetdents(directory, two.data(), static_cast<int>(two.size())) == 0);
+    Require(sceKernelLseek(directory, -2, 2) == 3);
+    Require(ReadAll(directory).size() == 2);
+    Require(sceKernelLseek(directory, -6, 2) == static_cast<int>(0x80020016u));
+    Require(sceKernelLseek(directory, 0, 2) == 5);
+
     std::array<char, 8> tiny{};
     Require(sceKernelLseek(directory, 0, 0) == 0);
     Require(sceKernelGetdents(directory, tiny.data(), static_cast<int>(tiny.size())) < 0);
