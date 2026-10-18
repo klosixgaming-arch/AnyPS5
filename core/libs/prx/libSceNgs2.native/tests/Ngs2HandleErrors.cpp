@@ -31,7 +31,24 @@ int main() {
         Status(sceNgs2RackGetVoiceHandle(rack, 0, nullptr), outputError, "valid rack lost null-output validation");
         Status(sceNgs2RackGetVoiceHandle(rack, 0, &value), SCE_NGS2_OK, "valid voice lookup failed");
         Require(value != 0 && value != sentinel);
+        constexpr int voiceError = static_cast<int>(0x804A8203u);
+        Ngs2VoiceParamHeader header{};
+        Ngs2VoiceState state{};
+        Ngs2VoicePortInfo portInfo{};
+        Ngs2VoiceChannelsInfo channels{};
+        uint32_t flags = 0;
+        for (const uintptr_t handle : {uintptr_t{0}, uintptr_t{0x1234}, rack, system}) {
+            Status(sceNgs2VoiceControl(handle, &header), voiceError, "voice control accepted an invalid voice handle");
+            Status(sceNgs2VoiceRunCommands(handle, nullptr, 0), voiceError, "voice commands accepted an invalid voice handle");
+            Status(sceNgs2VoiceGetState(handle, &state, sizeof(state)), voiceError, "voice state accepted an invalid voice handle");
+            Status(sceNgs2VoiceGetPortInfo(handle, 0, &portInfo, sizeof(portInfo)), voiceError, "voice port info accepted an invalid voice handle");
+            Status(sceNgs2VoiceQueryInfo(handle, SCE_NGS2_VOICE_INFO_CHANNELS, &channels, sizeof(channels)), voiceError, "voice info accepted an invalid voice handle");
+            Status(sceNgs2VoiceGetStateFlags(handle, &flags), voiceError, "voice state flags accepted an invalid voice handle");
+        }
+        const uintptr_t liveVoice = value;
+        Status(sceNgs2VoiceGetStateFlags(liveVoice, &flags), SCE_NGS2_OK, "valid voice lost state flags");
         Status(sceNgs2RackDestroy(rack, nullptr), SCE_NGS2_OK, "valid rack destroy failed");
+        Status(sceNgs2VoiceGetStateFlags(liveVoice, &flags), voiceError, "voice of a destroyed rack was still accepted");
         value = sentinel;
         Status(sceNgs2RackGetVoiceHandle(rack, 0, &value), rackError, "retired rack returned the wrong error");
         Require(value == sentinel);
