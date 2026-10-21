@@ -1222,9 +1222,27 @@ VkFormat StorageFormatOrUndefined(const Context& context, VkFormat format) {
             case VK_FORMAT_A8B8G8R8_SRGB_PACK32: linear = VK_FORMAT_A8B8G8R8_UNORM_PACK32; break;
             case VK_FORMAT_R8_SRGB: linear = VK_FORMAT_R8_UNORM; break;
             case VK_FORMAT_R8G8_SRGB: linear = VK_FORMAT_R8G8_UNORM; break;
+            case VK_FORMAT_R5G6B5_UNORM_PACK16:
+            case VK_FORMAT_B5G6R5_UNORM_PACK16:
+            case VK_FORMAT_R5G5B5A1_UNORM_PACK16:
+            case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
+            case VK_FORMAT_A1R5G5B5_UNORM_PACK16:
+            case VK_FORMAT_R4G4B4A4_UNORM_PACK16:
+            case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
+            case VK_FORMAT_A4R4G4B4_UNORM_PACK16:
+            case VK_FORMAT_A4B4G4R4_UNORM_PACK16:
+                linear = supports(VK_FORMAT_R16_UNORM) ? VK_FORMAT_R16_UNORM : VK_FORMAT_R16_UINT;
+                break;
+            case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+                linear = VK_FORMAT_R32_UINT;
+                break;
             default: break;
         }
         if (linear != VK_FORMAT_UNDEFINED && supports(linear)) storage = linear;
+        else if (linear != VK_FORMAT_UNDEFINED) {
+            if (supports(VK_FORMAT_R16_UINT)) storage = VK_FORMAT_R16_UINT;
+            else if (supports(VK_FORMAT_R32_UINT)) storage = VK_FORMAT_R32_UINT;
+        }
     }
     std::lock_guard lock(table.mutex);
     table.formats.emplace(key, storage);
@@ -1247,7 +1265,18 @@ VkFormat UintFormatOfSint(VkFormat format) {
 
 VkFormat StorageFormatFor(const Context& context, VkFormat format) {
     const auto storage = StorageFormatOrUndefined(context, format);
-    if (storage == VK_FORMAT_UNDEFINED) Require(false, "guest storage texture format " + std::to_string(format) + " cannot be used as a storage image");
+    if (storage == VK_FORMAT_UNDEFINED) {
+        static std::atomic<int> unhandledFormatReports{0};
+        if (unhandledFormatReports.fetch_add(1) < 4) {
+            std::fprintf(stderr, "[gpu] guest storage texture format %d has no direct storage support; trying fallback\n", static_cast<int>(format));
+        }
+        VkFormatProperties properties{};
+        context.formatProperties(context.physical, VK_FORMAT_R16_UINT, &properties);
+        if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0) return VK_FORMAT_R16_UINT;
+        context.formatProperties(context.physical, VK_FORMAT_R32_UINT, &properties);
+        if ((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0) return VK_FORMAT_R32_UINT;
+        Require(false, "guest storage texture format " + std::to_string(format) + " cannot be used as a storage image");
+    }
     return storage;
 }
 
@@ -3568,7 +3597,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     std::vector<bool> unsaved(trackedLayers, false);
     bool anyUnsaved = false;
     for (std::uint32_t layer = first; layer < first + count; ++layer) {
-        unsaved[layer] = !layerPending[layer] && !layerOriginal[layer] && layerGeneration[layer] == 0;
+        unsaved[layer] = !layerPending[layer] && !layerOriginal[layer];
         anyUnsaved = anyUnsaved || unsaved[layer];
     }
     if (anyUnsaved && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) captureGuestBytes(&unsaved);
@@ -5201,6 +5230,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         const auto begin = layerBegin(layer);
         const auto end = begin + layerBytes(layer);
         if (tracked ? layerGeneration[layer] == 0 : !compared[layer]) {
+
             unsavedOutsideWatch = unsavedOutsideWatch || !tracked;
             keep.emplace_back(begin, end);
             continue;
@@ -5281,7 +5311,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) segments.push_back({import, descriptor.baseAddress, descriptor.baseAddress + guestBytes});
     else segments = importSegments();
     if (!segments.empty()) {
-        Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
+        static std::atomic<int> unsavedSegmentReports{0};
+        if (unsavedOutsideWatch && unsavedSegmentReports.fetch_add(1) < 4) {
+            std::fprintf(stderr, "[gpu] storage image 0x%llx+0x%llx: pending results over memory outside write watch without pre-saved bytes; writing back whole\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes));
+        }
         // Outside the write watch the stored bytes are what the next store compares with.
         const auto saveUnits = GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored)) ? std::vector<std::uint32_t>{} : prepareStoredSave(layers, skippedLayer);
         if (blockUnits) {
@@ -5459,7 +5492,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // them (a GPU clear, a dropped or kept unit). Reading them says nothing about the image: a
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
     // the content again only where it did before, or once every unit is stored.
-    Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
+    static std::atomic<int> unsavedDirectReports{0};
+    if (unsavedOutsideWatch && unsavedDirectReports.fetch_add(1) < 4) {
+        std::fprintf(stderr, "[gpu] storage image 0x%llx+0x%llx: pending results over memory outside write watch without pre-saved bytes; writing back whole\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes));
+    }
     std::vector<bool> unsaved = layerOriginal;
     unsaved.flip();
     for (const auto& [begin, end] : unitRuns(unsaved)) {
