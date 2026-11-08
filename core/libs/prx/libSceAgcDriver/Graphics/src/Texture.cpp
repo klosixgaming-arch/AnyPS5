@@ -132,6 +132,7 @@ thread_local const char* uploadReason = "first";
 // (DiscardPendingInside) and units an alias's own results superseded (markLayersPending); relaxed,
 // reported only.
 std::atomic<std::uint64_t> singlePassMoves{0}, slabRetiles{0}, paddingSeedCopies{0}, linearImportRetiles{0};
+std::atomic<std::uint64_t> segmentedUploadCount{0};
 std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWriteBacks{0}, partialWriteBackBytes{0}, emptyWriteBacks{0}, coalescedWriteBacks{0}, unitsDropped{0}, unitsSuperseded{0}, clearHandOvers{0}, creationHandOvers{0}, handedOverSuperseded{0};
 // FlushPending listings skipped because no pending unit of the image lay inside the range, images
 // whose selected pending units were dropped because their memory is no longer registered (see
@@ -184,6 +185,8 @@ void reportStorageTraffic(StorageTraffic& traffic) {
         line += text;
         traffic.uploads[i] = {};
     }
+    std::snprintf(text, sizeof(text), " (direct from import segments %llu)", static_cast<unsigned long long>(segmentedUploadCount.exchange(0, std::memory_order_relaxed)));
+    line += text;
     line += "; by reason:";
     for (const auto& [reason, totals] : traffic.uploadReasons) {
         std::snprintf(text, sizeof(text), " %llu/%.1f", static_cast<unsigned long long>(totals.first), totals.second / 1048576.0);
@@ -3185,7 +3188,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 forgetBorrowed(0, trackedLayers);
                 runs.emplace_back(0, guestBytes);
             }
-            const auto uploadedBytes = uploadWindows(*import, runs, layers == nullptr && version == 0);
+            const ImportSegment single{import, descriptor.baseAddress, descriptor.baseAddress + guestBytes};
+            const auto uploadedBytes = uploadWindows(std::span(&single, 1), runs, layers == nullptr && version == 0);
             countStorageUpload(1, uploadedBytes);
             if (layers != nullptr) {
                 partialUploads.fetch_add(1, std::memory_order_relaxed);
@@ -3289,6 +3293,144 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         ++version;
         if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
         return;
+    }
+    static const bool segmentedUploads = std::getenv("APS5_NO_SEGMENTED_UPLOAD") == nullptr;
+    const bool windowed = blockUnits && (layers != nullptr || AnyShadowedOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
+    if (segmentedUploads && uploadedKeys == DccKeys::Uncompressed && (windowed || layers == nullptr)) {
+        const auto segments = importSegments();
+        const bool covering = !segments.empty() && segments.front().begin == descriptor.baseAddress && segments.back().end == descriptor.baseAddress + guestBytes;
+        const auto tailSplit = [&] {
+            for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+                for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+                    if (!geometry.HasLayer(level, layer) || !mips[level].tail) continue;
+                    const auto tailBegin = descriptor.baseAddress + geometry.GuestOffset(layer, mips[level]);
+                    const auto tailEnd = tailBegin + mips[level].tiledSize;
+                    for (const auto& segment : segments) {
+                        if (tailBegin < segment.end && tailEnd > segment.end) return true;
+                    }
+                }
+            }
+            return false;
+        };
+        if (covering && windowed && !tailSplit()) {
+            now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+            if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+                layerOriginal.assign(trackedLayers, false);
+                cancelStoredSaves();
+            } else {
+                captureGuestBytes(layers);
+            }
+            stampLayers(true);
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+            if (layers != nullptr) {
+                for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+                    if ((*layers)[unit]) forgetBorrowed(unit, 1);
+                }
+                runs = unitRuns(*layers);
+            } else {
+                forgetBorrowed(0, trackedLayers);
+                runs.emplace_back(0, guestBytes);
+            }
+            const auto uploadedBytes = uploadWindows(segments, runs, layers == nullptr && version == 0);
+            countStorageUpload(1, uploadedBytes);
+            if (layers != nullptr) {
+                partialUploads.fetch_add(1, std::memory_order_relaxed);
+                partialUploadBytes.fetch_add(uploadedBytes, std::memory_order_relaxed);
+            }
+            segmentedUploadCount.fetch_add(1, std::memory_order_relaxed);
+            ++Profile().storageDirectUploads;
+            ++version;
+            if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
+            return;
+        }
+        if (covering && !windowed) {
+            now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+            if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+                layerOriginal.assign(trackedLayers, false);
+                cancelStoredSaves();
+            } else {
+                captureGuestBytes(nullptr);
+            }
+            stampLayers(true);
+            PublishShadow(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), PublishScope::Whole, PublishReason::Upload);
+            forgetBorrowed(0, trackedLayers);
+            const bool direct = singlePass();
+            auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            detiler.BeginBatch();
+            auto* recorder = Recorder::Active();
+            std::unique_ptr<CommandBatch> batch;
+            VkCommandBuffer commands = VK_NULL_HANDLE;
+            auto timing = Recorder::NoTiming;
+            if (recorder != nullptr) {
+                recorder->FlushStoresOverlapping(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+                commands = recorder->Commands();
+                timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
+                recorder->Keep(tiled, tiled->Size());
+                if (linear) recorder->Keep(linear, linear->Size());
+                if (auto self = weak_from_this().lock()) keepStorageTexture(*recorder, std::move(self));
+                recorder->NotePendingRead(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), Recorder::ReadKind::StorageUpload);
+                Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, direct ? 3 : 4);
+                if (Recorder::BarrierValidate()) {
+                    const std::pair<std::uint64_t, std::uint64_t> read{descriptor.baseAddress, descriptor.baseAddress + guestBytes};
+                    const std::pair<VkImage, bool> written{image, true};
+                    recorder->NoteAccess(Recorder::CommandClass::StorageUpload, Recorder::Access{std::span(&read, 1), {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT});
+                }
+            } else {
+                batch = std::make_unique<CommandBatch>(context);
+                commands = batch->Handle();
+            }
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            for (const auto& segment : segments) CopyBuffer(context, commands, segment.import->buffer, HostImportOffset(*segment.import, segment.begin), tiled->Handle(), segment.begin - descriptor.baseAddress, segment.end - segment.begin);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            if (direct) {
+                recordDirectUploadBarrier(commands, true);
+                for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+                    for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                        if (!geometry.HasLayer(level, layer)) continue;
+                        const auto& mip = mips[level];
+                        detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, tiled->Handle(), geometry.GuestOffset(layer, mip), elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor});
+                    }
+                }
+                recordDirectUploadDone(commands);
+                singlePassMoves.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+                    for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                        if (!geometry.HasLayer(level, layer)) continue;
+                        const auto& mip = mips[level];
+                        detiler.Dispatch(commands, descriptor.tileMode, elementBytes, tiled->Handle(), geometry.GuestOffset(layer, mip), linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
+                    }
+                }
+                const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                toTransfer.srcAccessMask = 0u;
+                toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                toTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toTransfer.image = image;
+                toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, VK_REMAINING_ARRAY_LAYERS};
+                context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
+                const auto regions = CopyRegions(nullptr);
+                context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+                VkImageMemoryBarrier toGeneral = toTransfer;
+                toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+            }
+            if (batch) batch->SubmitAndWait();
+            else recorder->EndGpuTiming(timing, guestBytes);
+            segmentedUploadCount.fetch_add(1, std::memory_order_relaxed);
+            countStorageUpload(1, guestBytes);
+            ++Profile().storageDirectUploads;
+            ++version;
+            if (profile) LookupOutcomes::Add(LookupOutcomes::UploadDirect, start);
+            return;
+        }
     }
     const auto cpuLayers = uploadedKeys == DccKeys::Uncompressed && layers != nullptr ? cpuUploadLayers(*layers) : std::vector<bool>{};
     const bool selectedCpu = !cpuLayers.empty();
@@ -3643,7 +3785,7 @@ void StorageTexture::recordDirectUploadDone(VkCommandBuffer commands) {
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &written);
 }
 
-std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool discard) {
+std::uint64_t StorageTexture::uploadWindows(std::span<const ImportSegment> segments, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool discard) {
     const auto elementBytes = BytesPerElement(descriptor.format);
     // Each run's pieces by source (a unit shadow's slab while fresh, else the import), the tail
     // blocks moved whole by one window each; the windows are built per piece.
@@ -3657,7 +3799,33 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
             if (tailBlocks.empty() || tailBlocks.back().first != sliceBegin) tailBlocks.emplace_back(sliceBegin, sliceBegin + mip.tiledSize);
         }
     }
-    const auto sources = ShadowSources(context, import, descriptor.baseAddress, runs, tailBlocks);
+    std::vector<ShadowRun> sources;
+    std::vector<const HostImport*> sourceImports;
+    for (const auto& segment : segments) {
+        const auto low = segment.begin - descriptor.baseAddress;
+        const auto high = segment.end - descriptor.baseAddress;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> inside, tails;
+        for (const auto& [begin, end] : runs) {
+            if (std::max(begin, low) < std::min(end, high)) inside.emplace_back(std::max(begin, low), std::min(end, high));
+        }
+        for (const auto& [begin, end] : tailBlocks) {
+            if (begin >= low && end <= high) tails.emplace_back(begin, end);
+        }
+        for (auto& source : ShadowSources(context, *segment.import, descriptor.baseAddress, inside, tails)) {
+            sources.push_back(std::move(source));
+            sourceImports.push_back(segment.import);
+        }
+    }
+    std::shared_ptr<DeviceBuffer> joined;
+    if (segments.size() > 1) {
+        joined = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        for (auto& source : sources) {
+            if (source.shadow) continue;
+            source.buffer = joined->Handle();
+            source.offset = source.begin;
+        }
+    }
+    const VkBuffer importBuffer = joined != nullptr ? joined->Handle() : segments.front().import->buffer;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
     bool allShadow = true;
     for (const auto& source : sources) {
@@ -3701,12 +3869,13 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
         commands = recorder->Commands();
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
         if (linear) recorder->Keep(linear, linear->Size());
+        if (joined) recorder->Keep(joined, joined->Size());
         for (const auto& source : sources) {
             if (source.slab != nullptr) recorder->Keep(source.slab);
         }
         if (auto self = weak_from_this().lock()) keepStorageTexture(*recorder, std::move(self));
         if (!reads.empty()) recorder->NotePendingReads(reads, Recorder::ReadKind::StorageUpload);
-        Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, direct ? 2 : 3);
+        Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, (direct ? 2 : 3) + (joined != nullptr ? 2 : 0));
         if (Recorder::BarrierValidate()) {
             const std::pair<VkImage, bool> written{image, true};
             recorder->NoteAccess(Recorder::CommandClass::StorageUpload, Recorder::Access{reads, {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT});
@@ -3715,7 +3884,21 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
         batch = std::make_unique<CommandBatch>(context);
         commands = batch->Handle();
     }
-    const auto importOffset = HostImportOffset(import, descriptor.baseAddress);
+    const auto importOffset = joined != nullptr ? VkDeviceSize{0} : HostImportOffset(*segments.front().import, descriptor.baseAddress);
+    if (joined != nullptr) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        for (std::size_t index = 0; index < sources.size(); ++index) {
+            if (sources[index].shadow) continue;
+            CopyBuffer(context, commands, sourceImports[index]->buffer, HostImportOffset(*sourceImports[index], descriptor.baseAddress + sources[index].begin), joined->Handle(), sources[index].begin, sources[index].end - sources[index].begin);
+            for (const auto& [tailBegin, tailEnd] : tailBlocks) {
+                if (tailBegin >= sources[index].end || tailEnd <= sources[index].begin || (tailBegin >= sources[index].begin && tailEnd <= sources[index].end)) continue;
+                const auto holder = std::find_if(segments.begin(), segments.end(), [&](const ImportSegment& segment) { return segment.begin <= descriptor.baseAddress + tailBegin && descriptor.baseAddress + tailEnd <= segment.end; });
+                Require(holder != segments.end(), "storage image tail block spans import segments");
+                CopyBuffer(context, commands, holder->import->buffer, HostImportOffset(*holder->import, descriptor.baseAddress + tailBegin), joined->Handle(), tailBegin, tailEnd - tailBegin);
+            }
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
     if (direct) {
         recordDirectUploadBarrier(commands, discard);
         for (const auto& window : windows) {
@@ -3728,7 +3911,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
                 detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, source.buffer, source.offset + (window.tiledBegin - source.begin), view, mip, false, window.layer, detile);
             } else {
                 detile.tiledBase = 0;
-                detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import.buffer, importOffset + geometry.GuestOffset(window.layer, mip), view, mip, false, window.layer, detile);
+                detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, importBuffer, importOffset + geometry.GuestOffset(window.layer, mip), view, mip, false, window.layer, detile);
             }
         }
         recordDirectUploadDone(commands);
@@ -3752,7 +3935,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
         } else {
             // The import holds the whole mip: the window's tiled base is the mip's.
             detile.tiledBase = 0;
-            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import.buffer, importOffset + geometry.GuestOffset(window.layer, mip), linear->Handle(), positions[i], mip, false, window.layer, false, detile);
+            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, importBuffer, importOffset + geometry.GuestOffset(window.layer, mip), linear->Handle(), positions[i], mip, false, window.layer, false, detile);
         }
         for (auto region : window.regions) {
             region.bufferOffset += positions[i];

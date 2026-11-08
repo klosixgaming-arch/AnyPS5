@@ -8973,6 +8973,109 @@ void writeBackBlockTests(const Device& device, Recorder& recorder) {
     std::cout << "write-back blocks: ok\n";
 }
 
+void uploadBlockTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0 || 65536 % base.hostImportAlignment != 0) {
+        std::cout << "host imports unavailable: upload blocks not tested\n";
+        return;
+    }
+    constexpr std::size_t piece = 65536;
+    constexpr std::size_t window = std::size_t{8} << 20u;
+    struct Case {
+        const char* name;
+        std::size_t offset;
+        bool alternate;
+        bool segmented;
+    };
+    const Case cases[] = {
+        {"a 4 MiB image inside one 8 MiB window", 0, false, false},
+        {"a 4 MiB image across an 8 MiB window boundary", window - (2u << 20u), false, true},
+        {"a 4 MiB image across a window boundary over pieces of which every other one is not GPU mapped", window - (2u << 20u), true, false},
+    };
+    SetHostImportWindow(window);
+    struct Window {
+        ~Window() { SetHostImportWindow(0); }
+    } restore;
+    const auto pattern = [](std::size_t i) { return static_cast<std::uint8_t>(i * 131u + 7u); };
+    std::string failures;
+    for (const auto& test : cases) {
+        GuestTextureResource resource{};
+        resource.width = 1024;
+        resource.height = 1024;
+        resource.mipCount = 1;
+        resource.tileMode = TextureTileMode::kLinear;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        const auto surfaceBytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+        Require(surfaceBytes == (4u << 20u), std::string(test.name) + ": unexpected surface size");
+#ifdef _WIN32
+        void* reserved = VirtualAlloc(nullptr, 3 * window, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+        void* reserved = std::aligned_alloc(window, 3 * window);
+#endif
+        Require(reserved != nullptr, "cannot allocate the upload block");
+        auto* memory = static_cast<std::uint8_t*>(reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>(reserved) + window - 1) / window * window));
+        for (std::size_t i = 0; i < 2 * window; ++i) memory[i] = pattern(i);
+        std::vector<std::size_t> pieces;
+        for (std::size_t offset = 0; offset < 2 * window; offset += piece) pieces.push_back(offset);
+        {
+            GuestAllocations::Mutation mutation;
+            for (const auto offset : pieces) mutation.Add(memory + offset, piece, true, true, !test.alternate || offset / piece % 2 == 0);
+        }
+        ClearHostImports(base.device);
+        const auto address = reinterpret_cast<std::uint64_t>(memory) + test.offset;
+        TextureDetiler detiler(base);
+        auto context = base;
+        context.detiler = &detiler;
+        resource.baseAddress = address;
+        std::size_t segments = 0;
+        std::size_t restored = 0;
+        {
+            const auto before = HostImportCounters();
+            auto image = StorageTexture::Create(context, detiler, resource, 0);
+            recorder.Keep(image);
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+            const auto after = HostImportCounters();
+            segments = after.requesters[static_cast<std::size_t>(ImportRequester::Segment)].made - before.requesters[static_cast<std::size_t>(ImportRequester::Segment)].made;
+            Buffer readback(context, surfaceBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {resource.width, resource.height, 1};
+            context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+            const auto pixels = readback.Bytes();
+            for (std::size_t i = 0; i < pixels.size(); ++i) restored += std::to_integer<std::uint8_t>(pixels[i]) == pattern(test.offset + i) ? 1 : 0;
+        }
+        std::printf("%s: %zu segment imports at the upload, %zu of %zu bytes uploaded\n", test.name, segments, restored, surfaceBytes);
+        if ((segments != 0) != test.segmented) failures += std::string(test.name) + ": the upload " + (segments != 0 ? "read" : "did not read") + " the import segments\n";
+        if (restored != surfaceBytes) failures += std::string(test.name) + ": " + std::to_string(surfaceBytes - restored) + " bytes of the image differ from the guest bytes\n";
+        {
+            GuestAllocations::Mutation mutation;
+            for (const auto offset : pieces) mutation.Remove(memory + offset);
+        }
+        ClearHostImports(base.device);
+        recorder.Sync();
+#ifdef _WIN32
+        VirtualFree(reserved, 0, MEM_RELEASE);
+#else
+        std::free(reserved);
+#endif
+    }
+    if (!failures.empty()) throw std::runtime_error("upload blocks:\n" + failures);
+    std::cout << "upload blocks: ok\n";
+}
+
 bool flushWaitMipChainTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -15367,6 +15470,14 @@ int main(int argc, char** argv) {
             writeBackBlockTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--upload-blocks-only") {
+            if (device.GetContext().hostImportAlignment == 0) {
+                std::cout << "skipped, host imports are unavailable\n";
+                return 77;
+            }
+            uploadBlockTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--flush-wait-mip-chain-only") return flushWaitMipChainTests(device, recorder) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--metadata-pass-only") {
             metadataPassTests(device, recorder);
@@ -15541,6 +15652,7 @@ int main(int argc, char** argv) {
         writeBackPaddingTests(device, recorder, true);
         splitWriteBackTests(device, recorder);
         writeBackBlockTests(device, recorder);
+        uploadBlockTests(device, recorder);
         flushWaitMipChainTests(device, recorder);
         singlePassTests(device, recorder, false);
         singlePassTests(device, recorder, true);
